@@ -32,6 +32,8 @@ type NetworkHarness struct {
 
 	activeNodes map[int]*HarnessNode
 
+	nodesByPub map[string]*HarnessNode
+
 	// Alice and Bob are the initial seeder nodes that are automatically
 	// created to be the initial participants of the test network.
 	Alice *HarnessNode
@@ -56,6 +58,7 @@ type NetworkHarness struct {
 func NewNetworkHarness(r *rpctest.Harness) (*NetworkHarness, error) {
 	n := NetworkHarness{
 		activeNodes:          make(map[int]*HarnessNode),
+		nodesByPub:           make(map[string]*HarnessNode),
 		seenTxns:             make(chan *chainhash.Hash),
 		bitcoinWatchRequests: make(chan *txWatchRequest),
 		lndErrorChan:         make(chan error),
@@ -66,6 +69,21 @@ func NewNetworkHarness(r *rpctest.Harness) (*NetworkHarness, error) {
 	}
 	go n.networkWatcher()
 	return &n, nil
+}
+
+// LookUpNodeByPub queries the set of active nodes to locate a node according
+// to its public key. The second value will be true if the node was found, and
+// false otherwise.
+func (n *NetworkHarness) LookUpNodeByPub(pubStr string) (*HarnessNode, error) {
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+
+	node, ok := n.nodesByPub[pubStr]
+	if !ok {
+		return nil, fmt.Errorf("unable to find node")
+	}
+
+	return node, nil
 }
 
 // ProcessErrors returns a channel used for reporting any fatal process errors.
@@ -201,6 +219,7 @@ out:
 
 // TearDownAll tears down all active nodes within the test lightning network.
 func (n *NetworkHarness) TearDownAll() error {
+
 	for _, node := range n.activeNodes {
 		if err := n.ShutdownNode(node); err != nil {
 			return err
@@ -236,6 +255,12 @@ func (n *NetworkHarness) NewNode(extraArgs []string) (*HarnessNode, error) {
 		return nil, err
 	}
 
+	// With the node started, we can now record its public key within the
+	// global mapping.
+	n.mtx.Lock()
+	n.nodesByPub[node.PubKeyStr] = node
+	n.mtx.Unlock()
+
 	return node, nil
 }
 
@@ -261,28 +286,28 @@ func (n *NetworkHarness) ConnectNodes(ctx context.Context, a, b *HarnessNode) er
 		return err
 	}
 
-	timeout := time.After(time.Second * 15)
-	for {
-
-		select {
-		case <-timeout:
-			return fmt.Errorf("peers not connected within 15 seconds")
-		default:
-		}
-
+	err = WaitPredicate(func() bool {
 		// If node B is seen in the ListPeers response from node A,
 		// then we can exit early as the connection has been fully
 		// established.
 		resp, err := a.ListPeers(ctx, &lnrpc.ListPeersRequest{})
 		if err != nil {
-			return err
+			return false
 		}
+
 		for _, peer := range resp.Peers {
 			if peer.PubKey == b.PubKeyStr {
-				return nil
+				return true
 			}
 		}
+
+		return false
+	}, time.Second*15)
+	if err != nil {
+		return fmt.Errorf("peers not connected within 15 seconds")
 	}
+
+	return nil
 }
 
 // DisconnectNodes disconnects node a from node b by sending RPC message
@@ -617,32 +642,63 @@ func (n *NetworkHarness) CloseChannel(ctx context.Context,
 		Index: cp.OutputIndex,
 	}
 
-	// If we are not force closing the channel, wait for channel to become
-	// active before attempting to close it.
-	numTries := 10
-CheckActive:
-	for i := 0; !force && i < numTries; i++ {
+	// We'll wait for *both* nodes to read the channel as active if we're
+	// performing a cooperative channel closure.
+	if !force {
+		timeout := time.Second * 15
 		listReq := &lnrpc.ListChannelsRequest{}
-		listResp, err := lnNode.ListChannels(ctx, listReq)
-		if err != nil {
-			return nil, nil, fmt.Errorf("unable fetch node's "+
-				"channels: %v", err)
-		}
 
-		for _, c := range listResp.Channels {
-			if c.ChannelPoint == chanPoint.String() && c.Active {
-				break CheckActive
+		// We define two helper functions, one two locate a particular
+		// channel, and the other to check if a channel is active or
+		// not.
+		filterChannel := func(node *HarnessNode,
+			op wire.OutPoint) (*lnrpc.ActiveChannel, error) {
+			listResp, err := node.ListChannels(ctx, listReq)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, c := range listResp.Channels {
+				if c.ChannelPoint == op.String() {
+					return c, nil
+				}
+			}
+
+			return nil, fmt.Errorf("unable to find channel")
+		}
+		activeChanPredicate := func(node *HarnessNode) func() bool {
+			return func() bool {
+				channel, err := filterChannel(node, chanPoint)
+				if err != nil {
+				}
+
+				return channel.Active
 			}
 		}
 
-		if i == numTries-1 {
-			// Last iteration, and channel is still not active.
-			return nil, nil, fmt.Errorf("channel did not become " +
-				"active")
+		// Next, we'll fetch the target channel in order to get the
+		// harness node that'll be receiving the channel close request.
+		targetChan, err := filterChannel(lnNode, chanPoint)
+		if err != nil {
+			return nil, nil, err
+		}
+		receivingNode, err := n.LookUpNodeByPub(targetChan.RemotePubkey)
+		if err != nil {
+			return nil, nil, err
 		}
 
-		// Sleep, and try again.
-		time.Sleep(300 * time.Millisecond)
+		// Before proceeding, we'll ensure that the channel is active
+		// for both nodes.
+		err = WaitPredicate(activeChanPredicate(lnNode), timeout)
+		if err != nil {
+			return nil, nil, fmt.Errorf("channel of closing " +
+				"node not active in time")
+		}
+		err = WaitPredicate(activeChanPredicate(receivingNode), timeout)
+		if err != nil {
+			return nil, nil, fmt.Errorf("channel of receiving " +
+				"node not active in time")
+		}
 	}
 
 	closeReq := &lnrpc.CloseChannelRequest{
@@ -741,18 +797,49 @@ func (n *NetworkHarness) AssertChannelExists(ctx context.Context,
 	node *HarnessNode, chanPoint *wire.OutPoint) error {
 
 	req := &lnrpc.ListChannelsRequest{}
-	resp, err := node.ListChannels(ctx, req)
-	if err != nil {
-		return fmt.Errorf("unable fetch node's channels: %v", err)
+
+	var predErr error
+	pred := func() bool {
+		resp, err := node.ListChannels(ctx, req)
+		if err != nil {
+			predErr = fmt.Errorf("unable fetch node's channels: %v", err)
+			return false
+		}
+
+		for _, channel := range resp.Channels {
+			if channel.ChannelPoint == chanPoint.String() {
+				return true
+			}
+
+		}
+		return false
 	}
 
-	for _, channel := range resp.Channels {
-		if channel.ChannelPoint == chanPoint.String() {
+	if err := WaitPredicate(pred, time.Second*15); err != nil {
+		return fmt.Errorf("channel not found: %v", predErr)
+	}
+
+	return nil
+}
+
+// WaitPredicate is a helper test function that will wait for a timeout period
+// of time until the passed predicate returns true. This function is helpful as
+// timing doesn't always line up well when running integration tests with
+// several running lnd nodes. This function gives callers a way to assert that
+// some property is upheld within a particular time frame.
+func WaitPredicate(pred func() bool, timeout time.Duration) error {
+	exitTimer := time.After(timeout)
+	for {
+		select {
+		case <-exitTimer:
+			return fmt.Errorf("predicate not satisfied after time out")
+		default:
+		}
+
+		if pred() {
 			return nil
 		}
 	}
-
-	return fmt.Errorf("channel not found")
 }
 
 // DumpLogs reads the current logs generated by the passed node, and returns
